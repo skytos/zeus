@@ -34,43 +34,71 @@ func Run(args []string, input io.Reader, output *os.File, stderr *os.File) int {
 		return 1
 	}
 
-	// if stdout is a terminal, assume that stderr is a terminal as well
+	// setup stdout
 	isTerminal := ttyutils.IsTerminal(output.Fd())
 
-	var master, masterStderr, slave, slaveStderr *os.File
-	var err, err2 error
-	if isTerminal {
-		master, slave, err = pty.Open()
-		masterStderr, slaveStderr, err2 = pty.Open()
-	} else {
-		master, slave, err = unixsocket.Socketpair(syscall.SOCK_STREAM)
-		masterStderr, slaveStderr, err2 = unixsocket.Socketpair(syscall.SOCK_STREAM)
-	}
-	if err != nil {
-		slog.ErrorString(err.Error() + "\r")
-		return 1
-	}
-	if err2 != nil {
-		slog.ErrorString(err2.Error() + "\r")
-		return 1
-	}
+	var master, slave *os.File
 
+	if isTerminal {
+		var err error
+		master, slave, err = pty.Open()
+		if err != nil {
+			slog.ErrorString(err.Error() + "\r")
+			return 1
+		}
+	} else {
+		var err error
+		master, slave, err = unixsocket.Socketpair(syscall.SOCK_STREAM)
+		if err != nil {
+			slog.ErrorString(err.Error() + "\r")
+			return 1
+		}
+	}
 	defer master.Close()
+
+	// setup stderr
+	stderrIsTerminal := ttyutils.IsTerminal(stderr.Fd())
+
+	var masterStderr, slaveStderr *os.File
+	if isTerminal {
+		var err error
+		masterStderr, slaveStderr, err = pty.Open()
+		if err != nil {
+			slog.ErrorString(err.Error() + "\r")
+			return 1
+		}
+	} else {
+		var err error
+		masterStderr, slaveStderr, err = unixsocket.Socketpair(syscall.SOCK_STREAM)
+		if err != nil {
+			slog.ErrorString(err.Error() + "\r")
+			return 1
+		}
+	}
 	defer masterStderr.Close()
 
-	var oldState, oldStateStderr *ttyutils.Termios
+	// setup terminal for stdout
+	var oldState *ttyutils.Termios
 	if isTerminal {
+		var err error
 		oldState, err = ttyutils.MakeTerminalRaw(output.Fd())
 
 		if err != nil {
 			slog.ErrorString(err.Error() + "\r")
 			return 1
 		}
-		defer ttyutils.RestoreTerminalState(output.Fd(), oldStateStderr)
+		defer ttyutils.RestoreTerminalState(output.Fd(), oldState)
 
-		oldStateStderr, err2 = ttyutils.MakeTerminalRaw(stderr.Fd())
-		if err2 != nil {
-			slog.ErrorString(err2.Error() + "\r")
+	}
+
+	// setup termial for stderr
+	var oldStateStderr *ttyutils.Termios
+	if stderrIsTerminal {
+		var err error
+		oldStateStderr, err = ttyutils.MakeTerminalRaw(stderr.Fd())
+
+		if err != nil {
+			slog.ErrorString(err.Error() + "\r")
 			return 1
 		}
 		defer ttyutils.RestoreTerminalState(stderr.Fd(), oldStateStderr)
@@ -139,8 +167,11 @@ func Run(args []string, input io.Reader, output *os.File, stderr *os.File) int {
 					ttyutils.MirrorWinsize(output, master)
 					syscall.Kill(commandPid, syscall.SIGWINCH)
 				} else { // member of terminatingSignals
+					// TODO why do we need this? it is already defered...
 					ttyutils.RestoreTerminalState(output.Fd(), oldState)
-					ttyutils.RestoreTerminalState(stderr.Fd(), oldStateStderr)
+					if stderrIsTerminal {
+						ttyutils.RestoreTerminalState(stderr.Fd(), oldStateStderr)
+					}
 					print("\r")
 					syscall.Kill(commandPid, sig.(syscall.Signal))
 					os.Exit(1)
