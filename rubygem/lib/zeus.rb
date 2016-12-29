@@ -144,12 +144,13 @@ module Zeus
 
         plan.after_fork
         client_terminal = local.recv_io
+        client_terminal_stderr = local.recv_io
         local.write "P:#{Process.pid}:#{@parent_pid}:\0"
         local.close
 
         $stdin.reopen(client_terminal)
         $stdout.reopen(client_terminal)
-        $stderr.reopen(client_terminal)
+        $stderr.reopen(client_terminal_stderr)
         ARGV.replace(arguments)
 
         plan.send(identifier)

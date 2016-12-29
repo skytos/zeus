@@ -244,7 +244,7 @@ func TestZeusBoots(t *testing.T) {
 
 	cexit := make(chan int, 1)
 	go func() {
-		cexit <- zeusclient.Run([]string{"cmd"}, hangingReader{readCloser}, cmdWriter)
+		cexit <- zeusclient.Run([]string{"cmd"}, hangingReader{readCloser}, cmdWriter, cmdWriter)
 		time.Sleep(100 * time.Millisecond)
 		cmdWriter.Close()
 	}()
