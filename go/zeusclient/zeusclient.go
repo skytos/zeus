@@ -7,6 +7,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/burke/ttyutils"
@@ -184,8 +185,10 @@ func Run(args []string, input io.Reader, output *os.File, stderr *os.File) int {
 		}
 	}
 
-	eof := make(chan bool)
+	var endOfIO sync.WaitGroup
+
 	go func() {
+		endOfIO.Add(1)
 		for {
 			buf := make([]byte, 1024)
 			n, err := master.Read(buf)
@@ -193,15 +196,14 @@ func Run(args []string, input io.Reader, output *os.File, stderr *os.File) int {
 			if err == nil || (err == io.EOF && n > 0) {
 				output.Write(buf[:n])
 			} else {
-				eof <- true
+				endOfIO.Done()
 				break
 			}
-
 		}
 	}()
 
-	eofStderr := make(chan bool)
 	go func() {
+		endOfIO.Add(1)
 		for {
 			buf := make([]byte, 1024)
 			n, err := masterStderr.Read(buf)
@@ -209,18 +211,19 @@ func Run(args []string, input io.Reader, output *os.File, stderr *os.File) int {
 			if err == nil || (err == io.EOF && n > 0) {
 				stderr.Write(buf[:n])
 			} else {
-				eofStderr <- true
+				endOfIO.Done()
 				break
 			}
 		}
 	}()
 
 	go func() {
+		endOfIO.Add(1)
 		buf := make([]byte, 8192)
 		for {
 			n, err := input.Read(buf)
 			if err != nil {
-				eof <- true
+				endOfIO.Done()
 				break
 			}
 			if isTerminal {
@@ -240,8 +243,7 @@ func Run(args []string, input io.Reader, output *os.File, stderr *os.File) int {
 		}
 	}()
 
-	<-eof
-	<-eofStderr
+	endOfIO.Wait()
 
 	if exitStatus == -1 {
 		msg, err = usock.ReadMessage()
