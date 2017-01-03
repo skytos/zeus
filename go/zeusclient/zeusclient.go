@@ -167,11 +167,6 @@ func Run(args []string, input io.Reader, output *os.File, stderr *os.File) int {
 					ttyutils.MirrorWinsize(output, master)
 					syscall.Kill(commandPid, syscall.SIGWINCH)
 				} else { // member of terminatingSignals
-					// TODO why do we need this? it is already defered...
-					ttyutils.RestoreTerminalState(output.Fd(), oldState)
-					if stderrIsTerminal {
-						ttyutils.RestoreTerminalState(stderr.Fd(), oldStateStderr)
-					}
 					print("\r")
 					syscall.Kill(commandPid, sig.(syscall.Signal))
 					os.Exit(1)
