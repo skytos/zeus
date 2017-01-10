@@ -36,78 +36,22 @@ func Run(args []string, input io.Reader, output *os.File, stderr *os.File) int {
 	}
 
 	// setup stdout
-	isTerminal := ttyutils.IsTerminal(output.Fd())
-
-	var master, slave *os.File
-
-	if isTerminal {
-		var err error
-		master, slave, err = pty.Open()
-		if err != nil {
-			slog.ErrorString(err.Error() + "\r")
-			return 1
-		}
-	} else {
-		var err error
-		master, slave, err = unixsocket.Socketpair(syscall.SOCK_STREAM)
-		if err != nil {
-			slog.ErrorString(err.Error() + "\r")
-			return 1
-		}
+	localStdout, remoteStdout, outputIsTerminal, err := socketsForOutput(output)
+	if err != nil {
+		slog.ErrorString(err.Error() + "\r")
+		return 1
 	}
-	defer master.Close()
+	defer localStdout.Close()
+	defer remoteStdout.Close()
 
 	// setup stderr
-	stderrIsTerminal := ttyutils.IsTerminal(stderr.Fd())
-
-	var masterStderr, slaveStderr *os.File
-	if isTerminal {
-		var err error
-		masterStderr, slaveStderr, err = pty.Open()
-		if err != nil {
-			slog.ErrorString(err.Error() + "\r")
-			return 1
-		}
-	} else {
-		var err error
-		masterStderr, slaveStderr, err = unixsocket.Socketpair(syscall.SOCK_STREAM)
-		if err != nil {
-			slog.ErrorString(err.Error() + "\r")
-			return 1
-		}
+	localStderr, remoteStderr, _, err := socketsForOutput(stderr)
+	if err != nil {
+		slog.ErrorString(err.Error() + "\r")
+		return 1
 	}
-	defer masterStderr.Close()
-
-	// setup terminal for stdout
-	var oldState *ttyutils.Termios
-	if isTerminal {
-		var err error
-		oldState, err = ttyutils.MakeTerminalRaw(output.Fd())
-
-		if err != nil {
-			slog.ErrorString(err.Error() + "\r")
-			return 1
-		}
-		defer ttyutils.RestoreTerminalState(output.Fd(), oldState)
-
-	}
-
-	// setup termial for stderr
-	var oldStateStderr *ttyutils.Termios
-	if stderrIsTerminal {
-		var err error
-		oldStateStderr, err = ttyutils.MakeTerminalRaw(stderr.Fd())
-
-		if err != nil {
-			slog.ErrorString(err.Error() + "\r")
-			return 1
-		}
-		defer ttyutils.RestoreTerminalState(stderr.Fd(), oldStateStderr)
-	}
-
-	// should this happen if we're running over a pipe? I think maybe not?
-	ttyutils.MirrorWinsize(output, master)
-	ttyutils.MirrorWinsize(stderr, masterStderr)
+	defer localStderr.Close()
+	defer remoteStderr.Close()
 
 	addr, err := net.ResolveUnixAddr("unixgram", unixsocket.ZeusSockName())
 	if err != nil {
@@ -130,11 +74,8 @@ func Run(args []string, input io.Reader, output *os.File, stderr *os.File) int {
 		return 1
 	}
 
-	usock.WriteFD(int(slave.Fd()))
-	slave.Close()
-
-	usock.WriteFD(int(slaveStderr.Fd()))
-	slaveStderr.Close()
+	usock.WriteFD(int(remoteStdout.Fd()))
+	usock.WriteFD(int(remoteStderr.Fd()))
 
 	msg, err = usock.ReadMessage()
 	if err != nil {
@@ -156,7 +97,7 @@ func Run(args []string, input io.Reader, output *os.File, stderr *os.File) int {
 		return 1
 	}
 
-	if isTerminal {
+	if outputIsTerminal {
 		c := make(chan os.Signal, 1)
 		handledSignals := append(append(terminatingSignals, syscall.SIGWINCH), syscall.SIGCONT)
 		signal.Notify(c, handledSignals...)
@@ -165,7 +106,7 @@ func Run(args []string, input io.Reader, output *os.File, stderr *os.File) int {
 				if sig == syscall.SIGCONT {
 					syscall.Kill(commandPid, syscall.SIGCONT)
 				} else if sig == syscall.SIGWINCH {
-					ttyutils.MirrorWinsize(output, master)
+					ttyutils.MirrorWinsize(output, localStdout)
 					syscall.Kill(commandPid, syscall.SIGWINCH)
 				} else { // member of terminatingSignals
 					print("\r")
@@ -187,35 +128,17 @@ func Run(args []string, input io.Reader, output *os.File, stderr *os.File) int {
 
 	var endOfIO sync.WaitGroup
 
-	go func() {
-		endOfIO.Add(1)
-		for {
-			buf := make([]byte, 1024)
-			n, err := master.Read(buf)
+	err = forwardOutput(localStdout, output, endOfIO)
+	if err != nil {
+		slog.ErrorString(err.Error() + "\r")
+		return 1
+	}
 
-			if err == nil || (err == io.EOF && n > 0) {
-				output.Write(buf[:n])
-			} else {
-				endOfIO.Done()
-				break
-			}
-		}
-	}()
-
-	go func() {
-		endOfIO.Add(1)
-		for {
-			buf := make([]byte, 1024)
-			n, err := masterStderr.Read(buf)
-
-			if err == nil || (err == io.EOF && n > 0) {
-				stderr.Write(buf[:n])
-			} else {
-				endOfIO.Done()
-				break
-			}
-		}
-	}()
+	err = forwardOutput(localStderr, stderr, endOfIO)
+	if err != nil {
+		slog.ErrorString(err.Error() + "\r")
+		return 1
+	}
 
 	go func() {
 		endOfIO.Add(1)
@@ -226,7 +149,7 @@ func Run(args []string, input io.Reader, output *os.File, stderr *os.File) int {
 				endOfIO.Done()
 				break
 			}
-			if isTerminal {
+			if outputIsTerminal {
 				for i := 0; i < n; i++ {
 					switch buf[i] {
 					case sigInt:
@@ -239,7 +162,7 @@ func Run(args []string, input io.Reader, output *os.File, stderr *os.File) int {
 					}
 				}
 			}
-			master.Write(buf[:n])
+			localStdout.Write(buf[:n])
 		}
 	}()
 
@@ -289,4 +212,47 @@ func sendCommandLineArguments(usock *unixsocket.Usock, args []string) error {
 	}()
 
 	return nil
+}
+
+func socketsForOutput(out *os.File) (local, remote *os.File, outIsTerminal bool, err error) {
+	outIsTerminal = ttyutils.IsTerminal(out.Fd())
+
+	if outIsTerminal {
+		local, remote, err = pty.Open()
+	} else {
+		local, remote, err = unixsocket.Socketpair(syscall.SOCK_STREAM)
+	}
+
+	return
+}
+
+func forwardOutput(from, to *os.File, signalEnd sync.WaitGroup) (err error) {
+	var oldToState *ttyutils.Termios
+	ttyutils.MirrorWinsize(to, from)
+
+	if ttyutils.IsTerminal(to.Fd()) {
+		oldToState, err = ttyutils.MakeTerminalRaw(to.Fd())
+		if err != nil {
+			return
+		}
+	}
+
+	go func() {
+		defer ttyutils.RestoreTerminalState(to.Fd(), oldToState)
+
+		signalEnd.Add(1)
+		for {
+			buf := make([]byte, 1024)
+			n, err := from.Read(buf)
+
+			if err == nil || (err == io.EOF && n > 0) {
+				to.Write(buf[:n])
+			} else {
+				signalEnd.Done()
+				break
+			}
+		}
+	}()
+
+	return
 }
